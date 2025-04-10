@@ -1,6 +1,6 @@
 import requests
 import time
-from plyer import notification
+
 
 # CONFIG SECTION
 tracked_tokens = {
