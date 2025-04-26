@@ -1,143 +1,100 @@
-from flask import Flask, render_template_string
+from flask import Flask, render_template, request, jsonify
 import requests
-from datetime import datetime
-import os
-import sys
-import traceback
+import threading
+import time
+import os  # ✅ Added to get PORT from environment
 
 app = Flask(__name__)
 
-tracked_tokens = ['bitcoin', 'ethereum', 'solana', 'ripple']
-token_id_map = {
-    'bitcoin': 'bitcoin',
-    'ethereum': 'ethereum',
-    'solana': 'solana',
-    'ripple': 'ripple'
-}
-currency = 'usd'
-price_history = {token: [] for token in tracked_tokens}
-trend_flags = {token: {'last_trend': None, 'trend_streak': 0} for token in tracked_tokens}
+supported_coins = ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC", "DOT", "LINK", "AVAX"]
+selected_coins = []
+prices = {}
+price_history = {}
 
-html_template = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>Crypto Trend Alerts</title>
-    <style>
-        body { font-family: Arial, sans-serif; background-color: #0e0e0e; color: #f1f1f1; padding: 20px; }
-        h1 { color: #4caf50; }
-        .alert { color: red; font-weight: bold; }
-        .gainer { color: #4caf50; }
-        .price { margin-bottom: 10px; }
-        .section { margin-top: 20px; }
-    </style>
-</head>
-<body>
-    <h1>🚀 Crypto Trend Alert System</h1>
-    <div class="section">
-        <h2>Top Gainers (1h Change)</h2>
-        {% for gainer in gainers %}
-            <div class="gainer">{{ gainer }}</div>
-        {% endfor %}
-    </div>
-    <div class="section">
-        <h2>Current Prices & Trends</h2>
-        {% for line in alerts %}
-            <div class="price">{{ line }}</div>
-        {% endfor %}
-    </div>
-</body>
-</html>
-"""
-
-def get_price(token):
-    token_id = token_id_map[token]
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={token_id}&vs_currencies={currency}"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+def get_coinbase_price(symbol):
     try:
-        response = requests.get(url, headers=headers)
+        url = f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot"
+        response = requests.get(url)
         response.raise_for_status()
         data = response.json()
-        return data[token_id][currency] if token_id in data and currency in data[token_id] else None
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching price for {token}: {e}", file=sys.stderr)
+        return float(data["data"]["amount"])
+    except Exception as e:
+        print(f"[ERROR] Failed to get price for {symbol}: {e}")
         return None
 
-def get_top_gainers():
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            'vs_currency': currency,
-            'order': 'percent_change_1h_desc',
-            'per_page': 5,
-            'page': 1
-        }
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        response = requests.get(url, params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        return [
-            f"{coin['symbol'].upper()}: {coin['price_change_percentage_1h_in_currency']:.2f}% (${coin['current_price']:.2f})"
-            for coin in data if coin.get('price_change_percentage_1h_in_currency') is not None
-        ]
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching top gainers: {e}", file=sys.stderr)
-        return ["Error fetching top gainers"]
+def update_price_history(symbol, price):
+    if symbol not in price_history:
+        price_history[symbol] = []
+    price_history[symbol].append(price)
+    if len(price_history[symbol]) > 10:
+        price_history[symbol].pop(0)
 
-def percent_change(p1, p2):
-    return ((p2 - p1) / p1) * 100 if p1 != 0 else 0
+def check_trend(symbol):
+    history = price_history.get(symbol, [])
+    if len(history) >= 3:
+        if history[-3] > history[-2] > history[-1]:
+            return "WARNING"
+        elif history[-3] < history[-2] < history[-1]:
+            return "RISER"
+    return "Stable"
 
-@app.route("/")
+def get_top_risers():
+    return dict(sorted({
+        coin: round(history[-1] - history[0], 2)
+        for coin, history in price_history.items() if len(history) >= 2
+    }.items(), key=lambda x: x[1], reverse=True)[:3])
+
+def price_updater():
+    global prices
+    while True:
+        if selected_coins:
+            print(f"[UPDATE] Fetching prices for: {selected_coins}")
+            for coin in selected_coins:
+                price = get_coinbase_price(coin)
+                if price:
+                    prices[coin] = price
+                    update_price_history(coin, price)
+        time.sleep(300)  # Every 5 minutes
+
+@app.route("/", methods=["GET", "POST"])
 def index():
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    alerts = []
-    gainers = get_top_gainers()
+    global selected_coins
+    if request.method == "POST":
+        form_data = request.form.get("coins", "")
+        selected_coins = [c for c in form_data.split(",") if c]
 
-    for token in tracked_tokens:
-        price = get_price(token)
-        if price is None:
-            alerts.append(f"{token.upper()}: Error fetching price")
-            continue
+    trends = {coin: check_trend(coin) for coin in selected_coins}
+    top_risers = get_top_risers()
 
-        history = price_history[token]
-        history.append(price)
-        if len(history) > 6:
-            history.pop(0)
+    return render_template("index.html",
+        coins=supported_coins,
+        selected=selected_coins,
+        prices=prices,
+        trends=trends,
+        top_risers=top_risers,
+        price_history=price_history
+    )
 
-        alerts.append(f"[{timestamp}] {token.upper()}: ${price:.4f}")
+@app.route("/prices")
+def get_prices():
+    return jsonify(prices)
 
-        if len(history) >= 4:
-            p1, p2, p3, p4 = history[-4:]
-            c1, c2, c3 = percent_change(p1, p2), percent_change(p2, p3), percent_change(p3, p4)
+@app.route("/history")
+def get_history():
+    return jsonify(price_history)
 
-            if c1 > 0.5 and c2 > 0.5 and c3 > 0.5:
-                if trend_flags[token]['last_trend'] == 'up':
-                    trend_flags[token]['trend_streak'] += 1
-                else:
-                    trend_flags[token]['last_trend'] = 'up'
-                    trend_flags[token]['trend_streak'] = 1
-                if trend_flags[token]['trend_streak'] >= 2:
-                    alerts.append(f"🚨🚨 ALERT ALERT! Major Buying Signal with {token.upper()} 🚨🚨")
-                else:
-                    alerts.append(f"🔼 {token.upper()} rising — 3x gains (+{c1:.2f}%, +{c2:.2f}%, +{c3:.2f}%)")
-            elif c1 < -0.5 and c2 < -0.5 and c3 < -0.5:
-                trend_flags[token]['last_trend'] = 'down'
-                trend_flags[token]['trend_streak'] = 0
-                alerts.append(f"🔽 {token.upper()} dipping — 3x losses (-{abs(c1):.2f}%, -{abs(c2):.2f}%, -{abs(c3):.2f}%)")
-            else:
-                trend_flags[token]['last_trend'] = None
-                trend_flags[token]['trend_streak'] = 0
+@app.route("/trends")
+def get_trends():
+    return jsonify({coin: check_trend(coin) for coin in selected_coins})
 
-    return render_template_string(html_template, alerts=alerts, gainers=gainers)
+@app.route("/risers")
+def get_risers():
+    return jsonify(get_top_risers())
 
-if __name__ == '__main__':
-    try:
-        port_raw = os.environ.get("PORT", "5000")
-        port = int(port_raw) if port_raw.isdigit() else 5000
-        print(f"Starting Flask app on port {port}...", file=sys.stderr)
-        app.run(host='0.0.0.0', port=port)
-    except Exception as e:
-        print("Flask app failed to start:", file=sys.stderr)
-        traceback.print_exc()
-        sys.exit(1)
+if __name__ == "__main__":
+    print("🚀 Starting CryptoKitty + CryptoDog App...")
+    threading.Thread(target=price_updater, daemon=True).start()
+
+    # ✅ Here is the correct dynamic PORT binding for Render:
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host="0.0.0.0", port=port)
